@@ -177,6 +177,34 @@ class VoxCPM:
     def generate_streaming(self, *args, **kwargs) -> Generator[np.ndarray, None, None]:
         return self._generate(*args, streaming=True, **kwargs)
 
+    def create_streaming_session(
+        self,
+        reference_wav_path: Optional[str] = None,
+        cfg_value: float = 2.0,
+        inference_timesteps: int = 10,
+        streaming_prefix_len: int = 4,
+        max_kv_length: Optional[int] = None,
+    ):
+        """Open a Phase 1-A streaming session with persistent KV caches.
+
+        Returns a ``StreamingInputSession`` you can drive with interleaved
+        ``feed_text`` / ``flush_audio`` calls. See
+        :mod:`voxcpm.streaming` and ``docs/streaming-input.md``.
+        """
+        if not isinstance(self.tts_model, VoxCPM2Model):
+            raise NotImplementedError(
+                "create_streaming_session requires a VoxCPM2 model."
+            )
+        from .streaming import StreamingInputSession
+        return StreamingInputSession(
+            tts_model=self.tts_model,
+            reference_wav_path=reference_wav_path,
+            cfg_value=cfg_value,
+            inference_timesteps=inference_timesteps,
+            streaming_prefix_len=streaming_prefix_len,
+            max_kv_length=max_kv_length,
+        )
+
     def generate_streaming_input(
         self,
         text_iter: Iterable[str],
