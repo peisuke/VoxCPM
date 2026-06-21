@@ -21,9 +21,12 @@ import numpy as np
 import soundfile as sf
 
 os.environ.setdefault("HF_HOME", "/workspace/data/voxcpm-cache")
-os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
-os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
-os.environ.setdefault("TORCHINDUCTOR_DISABLE", "1")
+# Note: torch.compile path is faster (~10-15x) once nvcc + matching gcc are
+# available. Keep it ENABLED by default; uncomment the lines below to fall
+# back to eager mode if Triton/Inductor fail.
+# os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+# os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+# os.environ.setdefault("TORCHINDUCTOR_DISABLE", "1")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from voxcpm import VoxCPM
