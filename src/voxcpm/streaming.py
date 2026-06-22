@@ -144,8 +144,16 @@ class StreamingInputSession:
         self.m.residual_lm.kv_cache.fill_caches(residual_kv_cache_tuple)
         self.residual_hidden = residual_outputs[:, -1, :]
 
-        # LocDiT cond starts from the last reference patch latent.
-        self.prefix_feat_cond = feat[:, -1, :, :]  # [1, p, d]
+        # LocDiT cond: native ``_inference`` initialises this from
+        # ``feat[:, -1, ...]`` of the COMBINED sequence ``[ref + text_pad_zeros]``,
+        # so the boundary state used to roll the first generated patch is a
+        # zero patch, NOT the last real ref patch. Mirror that exactly —
+        # otherwise the first audio patch is conditioned on real reference
+        # latent which mismatches the training distribution and produces
+        # "haltingly Japanese" output even with a single chunk.
+        P = self.m.patch_size
+        D = self.m.audio_vae.latent_dim
+        self.prefix_feat_cond = torch.zeros((1, P, D), device=self.device, dtype=self.dtype)
 
         # Seed VAE decoder with last few ref patches for smooth start.
         context_len = min(self.streaming_prefix_len - 1, feat.shape[1])
