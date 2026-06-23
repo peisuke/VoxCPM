@@ -4,7 +4,7 @@ import re
 import json
 import tempfile
 import numpy as np
-from typing import Generator, Optional
+from typing import Generator, Iterable, Optional
 from huggingface_hub import snapshot_download
 from .model.voxcpm import VoxCPMModel, LoRAConfig
 from .model.voxcpm2 import VoxCPM2Model
@@ -176,6 +176,151 @@ class VoxCPM:
 
     def generate_streaming(self, *args, **kwargs) -> Generator[np.ndarray, None, None]:
         return self._generate(*args, streaming=True, **kwargs)
+
+    def create_streaming_session(
+        self,
+        reference_wav_path: Optional[str] = None,
+        cfg_value: float = 2.0,
+        inference_timesteps: int = 10,
+        streaming_prefix_len: int = 4,
+        max_kv_length: Optional[int] = None,
+    ):
+        """Open a Phase 1-A streaming session with persistent KV caches.
+
+        Returns a ``StreamingInputSession`` you can drive with interleaved
+        ``feed_text`` / ``flush_audio`` calls. See
+        :mod:`voxcpm.streaming` and ``docs/streaming-input.md``.
+        """
+        if not isinstance(self.tts_model, VoxCPM2Model):
+            raise NotImplementedError(
+                "create_streaming_session requires a VoxCPM2 model."
+            )
+        from .streaming import StreamingInputSession
+        return StreamingInputSession(
+            tts_model=self.tts_model,
+            reference_wav_path=reference_wav_path,
+            cfg_value=cfg_value,
+            inference_timesteps=inference_timesteps,
+            streaming_prefix_len=streaming_prefix_len,
+            max_kv_length=max_kv_length,
+        )
+
+    def generate_streaming_input(
+        self,
+        text_iter: Iterable[str],
+        reference_wav_path: Optional[str] = None,
+        prompt_wav_path: Optional[str] = None,
+        prompt_text: Optional[str] = None,
+        cfg_value: float = 2.0,
+        inference_timesteps: int = 10,
+        min_len: int = 2,
+        max_len: int = 4096,
+        normalize: bool = False,
+        denoise: bool = False,
+    ) -> Generator[np.ndarray, None, None]:
+        """Phase 0 PoC: input-streaming TTS via continuation-chained generation.
+
+        Accepts text in chunks and yields audio chunks. Uses VoxCPM2's existing
+        ``build_prompt_cache`` / ``merge_prompt_cache`` / ``_generate_with_prompt_cache``
+        to chain each text chunk as a continuation of the previous, preserving
+        voice and prosody across chunk boundaries.
+
+        Note (Phase 0): the model was not trained on chunked-text inputs, so
+        boundary artifacts (slight pitch/pause discontinuities) are expected.
+        Phase 2 will fine-tune VoxCPM2 with windowed interleaved data to
+        smooth these out. See ``docs/streaming-input.md``.
+
+        Args:
+            text_iter: Iterable yielding text chunks. The chunks should be at
+                natural boundaries (clause / phrase) for best quality.
+            reference_wav_path: Path to reference audio for voice cloning.
+                Persists across all chunks via ref_continuation mode.
+            prompt_wav_path: Path to prompt audio for continuation mode
+                (used only for the first chunk; subsequent chunks use the
+                accumulated generated audio).
+            prompt_text: Text of the prompt audio. Must be paired with
+                ``prompt_wav_path``.
+            cfg_value: Diffusion classifier-free guidance scale.
+            inference_timesteps: Number of diffusion sampling steps.
+            min_len: Minimum patch count per chunk.
+            max_len: Maximum patch count per chunk.
+            normalize: Whether to run text normalization on each chunk.
+            denoise: Whether to denoise the reference/prompt audio.
+
+        Yields:
+            np.ndarray: 1D waveform (float32, 48 kHz for VoxCPM2) for each
+            text chunk, in arrival order.
+        """
+        if not isinstance(self.tts_model, VoxCPM2Model):
+            raise NotImplementedError(
+                "generate_streaming_input requires a VoxCPM2 model (continuation "
+                "chaining uses build_prompt_cache/merge_prompt_cache)."
+            )
+
+        if (prompt_wav_path is None) != (prompt_text is None):
+            raise ValueError("prompt_wav_path and prompt_text must both be provided or both be None")
+
+        text_normalizer = None
+        if normalize:
+            from .utils.text_normalize import TextNormalizer
+            text_normalizer = TextNormalizer()
+
+        # Build the initial cache from voice prompt (ref + continuation as configured).
+        # If neither is provided, the first chunk runs in zero_shot mode.
+        cache = None
+        if reference_wav_path is not None or prompt_wav_path is not None:
+            actual_ref = reference_wav_path
+            actual_prompt = prompt_wav_path
+            tmp_files = []
+            try:
+                if denoise and self.denoiser is not None:
+                    if reference_wav_path is not None:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as t:
+                            tmp_files.append(t.name)
+                        self.denoiser.enhance(reference_wav_path, output_path=tmp_files[-1])
+                        actual_ref = tmp_files[-1]
+                    if prompt_wav_path is not None:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as t:
+                            tmp_files.append(t.name)
+                        self.denoiser.enhance(prompt_wav_path, output_path=tmp_files[-1])
+                        actual_prompt = tmp_files[-1]
+                cache = self.tts_model.build_prompt_cache(
+                    prompt_text=prompt_text,
+                    prompt_wav_path=actual_prompt,
+                    reference_wav_path=actual_ref,
+                )
+            finally:
+                for p in tmp_files:
+                    if p and os.path.exists(p):
+                        try:
+                            os.unlink(p)
+                        except OSError:
+                            pass
+
+        for raw_chunk in text_iter:
+            if not isinstance(raw_chunk, str):
+                continue
+            chunk_text = re.sub(r"\s+", " ", raw_chunk.replace("\n", " ")).strip()
+            if not chunk_text:
+                continue
+            if text_normalizer is not None:
+                chunk_text = text_normalizer.normalize(chunk_text)
+
+            wav, _, audio_feat = self.tts_model.generate_with_prompt_cache(
+                target_text=chunk_text,
+                prompt_cache=cache,
+                min_len=min_len,
+                max_len=max_len,
+                inference_timesteps=inference_timesteps,
+                cfg_value=cfg_value,
+                retry_badcase=False,
+            )
+
+            # Update cache with what we just generated so the next chunk
+            # continues seamlessly (preserves timbre and prosody).
+            cache = self.tts_model.merge_prompt_cache(cache, chunk_text, audio_feat)
+
+            yield wav.squeeze(0).cpu().numpy()
 
     def _generate(
         self,
