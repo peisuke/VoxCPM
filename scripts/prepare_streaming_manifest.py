@@ -237,6 +237,20 @@ class Word:
     end: Optional[float]
 
 
+_PUNCT = set("、。!?,.!?")  # both half/full width
+_TAGGER = None
+
+
+def _get_tagger():
+    # MeCab's mmap on the 187MB unidic_lite/sys.dic eventually fails under
+    # repeated open/close pressure inside one process. Build once, reuse.
+    global _TAGGER
+    if _TAGGER is None:
+        import fugashi
+        _TAGGER = fugashi.Tagger()
+    return _TAGGER
+
+
 def _morpheme_chunks(text: str, min_chars: int, max_chars: int) -> List[str]:
     """Split a string into chunks at morpheme boundaries, preferring punctuation.
 
@@ -244,9 +258,8 @@ def _morpheme_chunks(text: str, min_chars: int, max_chars: int) -> List[str]:
     ``min_chars`` AND we just hit a punctuation OR we've exceeded
     ``max_chars``, emit the chunk.
     """
-    import fugashi
-    tagger = fugashi.Tagger()
-    punct = set("、。!?,.!?")  # both half/full width
+    tagger = _get_tagger()
+    punct = _PUNCT
 
     chunks: List[str] = []
     buf = []

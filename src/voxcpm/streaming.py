@@ -200,6 +200,10 @@ class StreamingInputSession:
         token_ids = self.m.text_tokenizer(text)
         for tok in token_ids:
             self._push_token(int(tok), is_text=True)
+        # Training data has <SOA> between every (text-chunk, audio-chunk) pair.
+        # Resetting here means the next flush_audio() will push <SOA> before
+        # generating, matching the training distribution chunk-by-chunk.
+        self._audio_started = False
 
     # ------------------------------------------------------------------ #
     # Audio generation
@@ -227,6 +231,17 @@ class StreamingInputSession:
         if not self._audio_started:
             self._push_token(self.m.audio_start_token, is_text=True)
             self._audio_started = True
+            # Training places zeros as the diffusion conditioner at the first
+            # audio patch of every chunk (the previous sequence position is a
+            # text token, whose audio_feats slot is zero). After a previous
+            # chunk's generation, prefix_feat_cond holds that chunk's last
+            # patch — reset it here so chunk N+1 starts from the same
+            # condition the model saw during training.
+            P = self.m.patch_size
+            D = self.m.audio_vae.latent_dim
+            self.prefix_feat_cond = torch.zeros(
+                (1, P, D), device=self.device, dtype=self.dtype
+            )
 
         patch_size = self.m.patch_size
 
@@ -260,10 +275,10 @@ class StreamingInputSession:
             stop_flag = (
                 self.m.stop_head(self.m.stop_actn(stop_logits)).argmax(dim=-1)[0].item()
             )
-            if i >= min_patches and stop_flag == 1:
-                break
 
-            # Advance LM and RALM with the audio embed we just produced.
+            # Always advance LM/RALM with the audio embed we just produced so
+            # the KV cache contains every patch the listener heard — this
+            # matches the training sequence (audio patches → <EOA>).
             pos = torch.tensor([self.m.base_lm.kv_cache.step()], device=self.device)
             lm_h = self.m.base_lm.forward_step(curr_embed[:, 0, :], pos).clone()
             self.lm_hidden = self.m.fsq_layer(lm_h)
@@ -275,9 +290,19 @@ class StreamingInputSession:
                 residual_input, pos_r
             ).clone()
 
+            if i >= min_patches and stop_flag == 1:
+                break
+
             # Trim feat seq to streaming_prefix_len for memory.
             if len(self.pred_feat_seq) > self.streaming_prefix_len:
                 self.pred_feat_seq = self.pred_feat_seq[-self.streaming_prefix_len :]
+
+        # Either stop fired or max_patches was reached — either way this chunk
+        # is done. Push <EOA> so the KV state mirrors training between chunks:
+        #   [...text...] <SOA> [audio patches] <EOA> [next text...]
+        # Even on max_patches truncation we want <EOA> in the cache so the
+        # next feed_text/flush_audio pair stays in distribution.
+        self._push_token(self.m.audio_end_token, is_text=True)
 
     # ------------------------------------------------------------------ #
     # Lifecycle

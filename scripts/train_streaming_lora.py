@@ -9,16 +9,16 @@ LoRA targets:
 - ``base_lm`` + ``residual_lm`` (LM-side) only.
 - LocDiT and AudioVAE are frozen.
 
-Sequence layout per sample:
+Sequence layout per sample (VibeVoice-style per-chunk boundary markers):
 
-    [text_chunk_0 ids, audio_start_id,
-     audio_feats_0...,
-     text_chunk_1 ids,
-     audio_feats_1...,
+    [text_chunk_0 ids, audio_start_id, audio_feats_0..., audio_end_id,
+     text_chunk_1 ids, audio_start_id, audio_feats_1..., audio_end_id,
      ...
-     audio_feats_K..., audio_end_id]
+     text_chunk_K ids, audio_start_id, audio_feats_K..., audio_end_id]
 
-Loss is computed only on audio positions (same as the original packer).
+Stop labels are 1 at the last audio patch of each chunk (= the position right
+before its audio_end_id), 0 elsewhere. Loss is computed on audio positions
+only (loss_mask = audio_mask).
 
 Usage:
     python scripts/train_streaming_lora.py \\
@@ -177,25 +177,22 @@ def build_streaming_sequence(
         audio_mask_l.append(1)
         loss_mask_l.append(1)
 
+    # VibeVoice-style per-chunk boundary tokens. Each chunk produces:
+    #     [text tokens] <SOA> [audio patches] <EOA>
+    # The <EOA> after every audio block gives the model an explicit "this
+    # chunk is done, next text chunk is coming" signal, matching what the
+    # inference loop in streaming.py pushes when stop fires.
     for i, ch in enumerate(chunks):
         toks = tokenize(ch["text"])
         for t in toks:
             push_text_token(int(t))
-        # Drop the <SOA> marker after every chunk so the model learns
-        # "text chunk then audio segment" repeatedly.
         push_text_token(audio_start_id)
         s = _quantize_time_to_patch(float(ch["start"]), audio_vae_fps, patch_size)
         e = _quantize_time_to_patch(float(ch["end"]), audio_vae_fps, patch_size)
         e = min(max(e, s + 1), T_patch)
         for p_idx in range(s, e):
             push_audio_patch(feat[p_idx])
-
-    # Closing audio_end_id position.
-    text_ids.append(audio_end_id)
-    audio_pieces.append(torch.zeros(P, D, dtype=feat.dtype))
-    text_mask_l.append(1)
-    audio_mask_l.append(0)
-    loss_mask_l.append(0)
+        push_text_token(audio_end_id)
 
     text_tokens = torch.tensor(text_ids, dtype=torch.int32)
     audio_feats = torch.stack(audio_pieces, dim=0)  # [T, P, D]
@@ -203,10 +200,21 @@ def build_streaming_sequence(
     audio_mask = torch.tensor(audio_mask_l, dtype=torch.int32)
     loss_mask = torch.tensor(loss_mask_l, dtype=torch.int32)
     labels = torch.zeros(text_tokens.size(0), dtype=torch.int32)
-    # Mark the last audio position as a stop target.
-    audio_idx = (audio_mask == 1).nonzero(as_tuple=False)
-    if audio_idx.numel() > 0:
-        labels[int(audio_idx[-1].item())] = 1
+    # Mark the last audio patch of EACH chunk as a stop target. A position is
+    # "end of a chunk" when the next position in the sequence is not also an
+    # audio patch — i.e. when chunk-text resumes (or the closing audio_end_id
+    # / pad lands). Marking only the last audio of the whole sequence taught
+    # the model "never emit stop mid-stream", which at inference time made
+    # every chunk run to max_patches and produce the looped audio we heard.
+    audio_idx = (audio_mask == 1).nonzero(as_tuple=False).squeeze(-1)
+    for i in range(audio_idx.numel()):
+        pos = int(audio_idx[i].item())
+        is_last_in_chunk = (
+            i == audio_idx.numel() - 1
+            or int(audio_idx[i + 1].item()) != pos + 1
+        )
+        if is_last_in_chunk:
+            labels[pos] = 1
 
     return {
         "text_tokens": text_tokens,
